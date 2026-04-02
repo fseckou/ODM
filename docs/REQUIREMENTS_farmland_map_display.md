@@ -303,6 +303,85 @@ Key processing options for farmland use: `--dsm`, `--dtm`, `--cog`, `--orthophot
 | DATA-04 | GeoPackage or PostGIS storage for field boundaries and vector data | P1 |
 | DATA-05 | Retain processing options and NodeODM task configuration per result | P1 |
 
+### 2.9 Colormap & Visualization (REQ-COLOR)
+
+#### How WebODM Handles Coloring
+
+WebODM uses **rio-tiler's colormap system** — 256-entry RGBA lookup tables (LUTs) stored as `.npy` files. The pipeline:
+
+1. **Band math** produces a single-band float raster (e.g., NDVI values -1 to +1)
+2. **Rescaling** linearly maps `[min, max]` → `[0, 255]` via `post_process(in_range=(rescale_arr,))`
+3. **LUT application** maps each uint8 value to an RGBA color via `render(colormap=...)`
+4. Returns a colored PNG tile to the browser
+
+WebODM registers **two custom NDVI-specific colormaps** (in `app/api/custom_colormaps_helper.py`) on top of the rio-tiler built-ins:
+
+| Colormap | Description | Colors |
+|---|---|---|
+| **`discrete_ndvi`** | "Contrast NDVI" — 5 sharp bands | `#AD0028` (dead/bare) → `#FFAB69` → `#FDFEC2` → `#77CA6F` → `#014729` (healthy) |
+| **`better_discrete_ndvi`** | "Custom NDVI Index" — 20-step smooth gradient | `#AD0028` → through oranges/yellows → `#007E47` |
+
+**Default colormaps per layer type:**
+
+| Layer | Server default | Frontend typically requests | Rescale range |
+|---|---|---|---|
+| VI (any formula) | `gray` (server fallback) | `rdylgn` (red-yellow-green diverging) | `(-1, 1)` for normalized indices |
+| Thermal | `gray` | `magma` | sensor-dependent |
+| DSM/DTM tiles | `gray` | `viridis` | `(0, 1000)` |
+| DSM/DTM export | `viridis` | — | `(0, 1000)` |
+| Plain orthophoto | None (RGB passthrough) | — | `(0, 255)` |
+
+**Available colormaps for VI layers:** `rdylgn`, `spectral`, `rdylgn_r`, `spectral_r`, `rplumbo`, `discrete_ndvi`, `better_discrete_ndvi`, `viridis`, `plasma`, `inferno`, `magma`, `cividis`, `jet`, `jet_r`
+
+**Available colormaps for DEM layers:** `viridis`, `jet`, `terrain`, `gist_earth`, `pastel1`
+
+#### ODM's DEM Tile Coloring
+
+ODM itself (separate from WebODM) uses a **Viridis-derived** color relief for pre-rendered DEM tiles (`opendm/tiles/color_relief.txt`):
+
+```
+0%   →  rgb(68, 1, 84)     dark purple (low elevation)
+10%  →  rgb(72, 36, 117)    purple
+20%  →  rgb(64, 67, 135)    indigo
+30%  →  rgb(52, 95, 141)    teal-blue
+40%  →  rgb(41, 120, 142)   cyan
+50%  →  rgb(32, 144, 141)   teal
+60%  →  rgb(34, 168, 132)   green-teal
+70%  →  rgb(67, 191, 112)   green
+80%  →  rgb(122, 210, 81)   yellow-green
+90%  →  rgb(188, 223, 39)   yellow
+100% →  rgb(253, 231, 37)   bright yellow (high elevation)
+nv   →  transparent          no-data
+```
+
+This is then **merged with hillshade** via HSV blending (`hsv_merge.py`): the color relief provides hue+saturation, while the hillshade provides the value/intensity channel. This creates a 3D terrain appearance.
+
+#### Requirements for Our System
+
+| ID | Requirement | Priority |
+|---|---|---|
+| COLOR-01 | Support all 24 WebODM VI formulas with appropriate default colormaps | P0 |
+| COLOR-02 | Default VI colormap: `rdylgn` (red=stress, yellow=moderate, green=healthy) — universally understood by agronomists | P0 |
+| COLOR-03 | User-selectable colormap from dropdown (at minimum: `rdylgn`, `spectral`, `viridis`, `discrete_ndvi`, `jet`) | P1 |
+| COLOR-04 | Interactive rescale slider: user adjusts min/max to enhance contrast in their specific field | P0 |
+| COLOR-05 | Custom farmland-specific colormaps for domain use cases (see table below) | P1 |
+| COLOR-06 | Color legend overlay on map showing value-to-color mapping with units | P0 |
+| COLOR-07 | DEM visualization with hillshade-blended color relief (HSV merge approach) | P1 |
+| COLOR-08 | Agent-selectable colormap: agents can request specific colormaps via API when generating analysis tiles | P1 |
+| COLOR-09 | Support discrete (classified) and continuous (gradient) colormap modes | P1 |
+| COLOR-10 | Thermal layers default to `magma` colormap with Celsius rescaling | P1 |
+
+#### Recommended Farmland-Specific Colormaps
+
+| Colormap Name | Use Case | Color Stops | Rationale |
+|---|---|---|---|
+| **`crop_health`** | NDVI/NDRE general health | Brown `#8B4513` → Red `#D32F2F` → Orange `#FF9800` → Yellow `#FFEB3B` → Light Green `#8BC34A` → Dark Green `#1B5E20` | Agronomist-friendly, bare soil reads as brown not red |
+| **`water_stress`** | NDWI / irrigation monitoring | Dark Red `#B71C1C` → Orange `#FF6F00` → Yellow `#FDD835` → Light Blue `#4FC3F7` → Blue `#0D47A1` | Red = dry stress, blue = adequate water |
+| **`nitrogen_status`** | NDRE / GNDVI for N deficiency | Red `#D32F2F` → Yellow `#FFC107` → Green `#388E3C` → Dark Green `#1B5E20` | Red = N deficient, green = sufficient |
+| **`yield_zones`** | Discrete management zones | Red `#E53935` → Orange `#FB8C00` → Yellow `#FDD835` → Green `#43A047` → Dark Green `#2E7D32` | 5 discrete classes for variable-rate application maps |
+| **`thermal_crop`** | Canopy temperature | Blue `#1565C0` → Cyan `#00BCD4` → Green `#4CAF50` → Yellow `#FFEB3B` → Red `#D32F2F` | Cool (irrigated) → hot (water stress) |
+| **`bare_soil`** | EXG / soil vs vegetation | Brown `#5D4037` → Tan `#D7CCC8` → Light Green `#AED581` → Green `#2E7D32` | Distinguishes bare soil from crop cover |
+
 ---
 
 ## 3. Recommended Technology Stack
