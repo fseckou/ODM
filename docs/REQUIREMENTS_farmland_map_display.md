@@ -17,6 +17,24 @@ WebODM is a Django + Django REST Framework application that:
 - Renders maps client-side with **Leaflet.js**
 - Extends functionality through a **plugin system** (Plant Health, Contours, etc.)
 
+**Full WebODM stack:**
+```
+Browser (React + Leaflet + Potree for 3D point clouds)
+    ↓
+Nginx (reverse proxy)
+    ↓
+Gunicorn (WSGI)
+    ↓
+Django + Django REST Framework
+    ├── app/api/tiler.py     → tile serving (rio-tiler 2.1.2 + rasterio 1.3.10)
+    ├── app/api/formulas.py  → 24 vegetation index formulas
+    ├── app/api/urls.py      → REST API routing
+    ├── Celery workers       → background tasks (image resize, result retrieval)
+    └── NodeODM connection   → processing engine (port 3000)
+```
+
+**Key insight:** WebODM does NOT use TiTiler or a separate tile server. Django serves tiles directly via rio-tiler's `COGReader` in the same process. There is no tile pre-rendering — tiles are generated on-the-fly from COG/GeoTIFF files on each request.
+
 ### 1.2 Tile Serving
 
 WebODM serves raster tiles **on-the-fly from COG (Cloud Optimized GeoTIFF)** files:
@@ -35,34 +53,66 @@ The tiler reads COG files directly using `rio-tiler`, extracting only the bytes 
 
 ### 1.3 Vegetation Index (VI) Generation
 
-WebODM's **Plant Health plugin** computes vegetation indices using a **hybrid server + client approach**:
+WebODM computes vegetation indices **entirely server-side** in `app/api/tiler.py`:
 
-**Server-side:** The tiler serves individual raster bands as tiles. For multispectral data (4+ bands), it serves raw band values. The metadata endpoint reports available bands (R, G, B, NIR, RedEdge) and their statistics.
+**How it works:** The frontend (React + Leaflet in `Map.jsx`) detects available bands from the orthophoto metadata, selects the appropriate formula name, and passes it as a query parameter on tile requests (`?formula=NDVI&bands=auto&color_map=rdylgn`). The server applies the formula via `lookup_formula()` from `app/api/formulas.py`, applies a colormap, and returns pre-rendered colored tiles. The browser never does band math — it only receives already-colored PNG tiles.
 
-**Client-side (browser):** JavaScript applies band math formulas pixel-by-pixel on each tile using canvas/WebGL. Available formulas:
+**Auto-selection logic:**
+- Multispectral with NIR band → requests `NDVI`
+- RGB-only → requests `VARI`
+- Thermal (2-band LWIR) → requests `Celsius` with `color_map=magma`
 
-| Index | Formula | Bands Required | Use Case |
+**All 24 formulas** (defined in `app/api/formulas.py`):
+
+| Index | Formula | Bands | Farmland Use |
 |---|---|---|---|
-| **NDVI** | `(NIR - RED) / (NIR + RED)` | NIR + RED | Crop vigor, biomass |
-| **NDRE** | `(NIR - RE) / (NIR + RE)` | NIR + RedEdge | Chlorophyll content |
-| **GNDVI** | `(NIR - GREEN) / (NIR + GREEN)` | NIR + GREEN | Nitrogen status |
-| **VARI** | `(GREEN - RED) / (GREEN + RED - BLUE)` | RGB only | Visible-light vegetation |
-| **NGRDI** | `(GREEN - RED) / (GREEN + RED)` | RGB only | Greenness |
-| **TGI** | `GREEN - 0.39*RED - 0.61*BLUE` | RGB only | Leaf chlorophyll |
-| **EXG** | `2*GREEN - RED - BLUE` | RGB only | Excess green |
+| **NDVI** | `(N - R) / (N + R)` | NIR, R | Crop vigor, biomass estimation |
+| **NDRE** | `(N - Re) / (N + Re)` | NIR, RE | Chlorophyll / nitrogen status |
+| **GNDVI** | `(N - G) / (N + G)` | NIR, G | Canopy nitrogen |
+| **NDWI** | `(G - N) / (G + N)` | G, NIR | Water stress detection |
+| **NDYI** | `(G - B) / (G + B)` | G, B | Flowering detection (canola) |
+| **ENDVI** | `((N+G) - 2B) / ((N+G) + 2B)` | NIR, G, B | Enhanced vegetation |
+| **EVI** | `2.5*(N-R) / (N+6R-7.5B+1)` | NIR, R, B | High-biomass areas |
+| **LAI** | `3.618*EVI - 0.118` | NIR, R, B | Leaf area index |
+| **SAVI** | `1.5*(N-R) / (N+R+0.5)` | NIR, R | Sparse vegetation / bare soil |
+| **OSAVI** | `(N-R) / (N+R+0.16)` | NIR, R | Variable soil backgrounds |
+| **VARI** | `(G - R) / (G + R - B)` | RGB | Visible-light vegetation (no NIR) |
+| **EXG** | `2*G - R - B` | RGB | Excess green (weed detection) |
+| **MPRI** | `(G - R) / (G + R)` | G, R | Modified photochemical reflectance |
+| **GLI** | `(2G - R - B) / (2G + R + B)` | RGB | Green leaf index |
+| **vNDVI** | `0.5268*(R^-0.1294 * G^0.3389 * B^-0.3118)` | RGB | Visible-band NDVI approximation |
+| **BAI** | `1 / ((0.1-R)^2 + (0.06-N)^2)` | R, NIR | Burn area index |
+| **GRVI** | `N / G` | NIR, G | Green ratio |
+| **MNLI** | `(N^2 - R)*1.5 / (N^2 + R + 0.5)` | NIR, R | Modified non-linear index |
+| **MSR** | `((N/R)-1) / (sqrt(N/R)+1)` | NIR, R | Modified simple ratio |
+| **RDVI** | `(N-R) / sqrt(N+R)` | NIR, R | Renormalized difference |
+| **TDVI** | `1.5*(N-R) / sqrt(N^2 + R + 0.5)` | NIR, R | Transformed difference |
+| **ARVI** | `(N - 2R + B) / (N + 2R + B)` | NIR, R, B | Atmospherically resistant |
+| **Celsius** | `L` | LWIR | Thermal / irrigation monitoring |
+| **Kelvin** | `L*100 + 27315` | LWIR | Thermal (raw) |
 
-The result is false-colored using a configurable color ramp (RdYlGn diverging palette). Users can adjust histogram stretch (min/max) interactively.
+Results are false-colored using configurable color ramps (default: `rdylgn` diverging palette). Users can adjust rescaling (min/max) interactively via query parameters.
 
 ### 1.4 Contour Line Generation
 
-WebODM generates contours **on-demand** (not pre-computed) via its Contours plugin:
+WebODM generates contours **on-demand** (not pre-computed) via its Contours core plugin (`coreplugins/contours/api.py`):
 
 1. User requests contours with a chosen interval (e.g., 1m, 0.25m)
-2. Server invokes a **GRASS GIS** session (`r.contour` on the DSM/DTM GeoTIFF)
-3. Contour lines are returned as **GeoJSON** (or exported as Shapefile/DXF)
-4. Leaflet renders the GeoJSON vectors as an overlay layer
+2. Server runs a **pure GDAL pipeline** (current versions replaced GRASS GIS):
+   - `gdalwarp` — crops DEM to task boundary
+   - `gdal_contour` — extracts contour isolines with elevation attributes
+   - `ogr2ogr` — reprojects/converts to requested output format
+3. For preview: GeoJSON returned to Leaflet as vector overlay
+4. For export: served via `TaskContoursDownload` endpoint
 
-Parameters: EPSG code, simplification factor, output format, contour interval, layer (DSM vs DTM).
+| Parameter | Default | Purpose |
+|---|---|---|
+| `layer` | required | DSM or DTM source |
+| `epsg` | 3857 | Output coordinate reference system |
+| `interval` | 1 | Contour spacing in meters |
+| `format` | GPKG | Output format (GPKG, Shapefile, DXF, GeoJSON) |
+| `simplify` | 0.01 | Line simplification tolerance |
+| `zfactor` | 1 | Vertical exaggeration factor |
 
 ### 1.5 ODM Output Artifacts
 
@@ -98,10 +148,13 @@ NodeODM exposes a REST API (default port 3000):
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/info` | Server info, version, available options |
-| `POST` | `/task/new` | Create processing task (multipart: images + options) |
+| `POST` | `/task/new` | Create processing task (small uploads, multipart) |
+| `POST` | `/task/new/init` | Initialize chunked upload (large datasets) |
+| `POST` | `/task/new/upload/{uuid}` | Upload chunk for initialized task |
+| `POST` | `/task/new/commit/{uuid}` | Commit and start processing |
 | `GET` | `/task/{uuid}/info` | Task status, progress, processing time |
 | `GET` | `/task/{uuid}/output` | Processing console output (streaming) |
-| `GET` | `/task/{uuid}/download/{asset}` | Download result (all.zip, orthophoto.tif, etc.) |
+| `GET` | `/task/{uuid}/download/all.zip` | Download all results as zip archive |
 | `POST` | `/task/{uuid}/cancel` | Cancel running task |
 | `POST` | `/task/{uuid}/remove` | Remove task and results |
 | `POST` | `/task/{uuid}/restart` | Restart a failed/cancelled task |
@@ -298,13 +351,15 @@ Notes:
 
 ## 5. VI Computation Approaches (Decision Matrix)
 
+WebODM uses **server-side only** (rio-tiler band math in Django). We should evaluate all three:
+
 | Approach | Pros | Cons | When to Use |
 |---|---|---|---|
-| **Client-side canvas** | Interactive, no server load, instant histogram adjust | Limited to visible tiles, no full-field stats | User exploring map interactively |
-| **TiTiler band math** | Server-rendered tiles, consistent, cacheable | Server CPU, less interactive | Default display, agent-consumed layers |
-| **Pre-computed GeoTIFF** | Fastest serving, full-field raster for analysis | Storage cost, stale if params change | Agent analysis, zonal stats, ML input |
+| **Server-side tile math** (WebODM approach) | Consistent rendering, cacheable, formula library server-controlled, agent-accessible | Server CPU per tile, round-trip for parameter changes | Default display mode, agent API consumption |
+| **Client-side canvas** | Instant histogram/rescale adjustment, no server round-trip | Limited to visible tiles, no full-field stats, JS complexity | Interactive fine-tuning after initial server render |
+| **Pre-computed GeoTIFF** | Fastest serving, full-field raster for ML/analysis | Storage cost, stale if params change | Agent analysis, zonal stats, ML pipeline input |
 
-**Recommendation:** Use TiTiler band math as primary (TILE-10 + VI-03), with client-side canvas for interactive adjustment (VI-05), and pre-computed GeoTIFFs for agent consumption (VI-07).
+**Recommendation:** Use TiTiler server-side band math as primary (matching WebODM's proven approach), with client-side canvas for interactive rescaling only (VI-05), and pre-computed GeoTIFFs for agent consumption (VI-07).
 
 ---
 
